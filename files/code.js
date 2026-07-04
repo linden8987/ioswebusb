@@ -1,18 +1,33 @@
 /**
- * code.js
- * 
- * This is the exact code fetched from the remote URL. It overrides 
- * the browser's global WebUSB API and pipes everything into the 
- * iOS custom bridge handler.
+ * code.js - Real WebUSB iOS Bridge Polyfill
+ * Overrides native browser layout and wires it directly to iOS CoreUSB hardware handles.
  */
 (function() {
-    // Verify the execution environment is inside our custom iOS App Container
     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.iosUSBBridge) {
         
-        // Setup global callback container for asynchronous native-to-JS communication
         window.iosUSBCallbacks = window.iosUSBCallbacks || {};
 
-        // Native pipeline resolution hook called from Swift when operations succeed
+        // Helper utilities to map binary objects across the text-based iOS script bridge
+        const ArrayBufferToBase64 = (buffer) => {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return window.btoa(binary);
+        };
+
+        const Base64ToArrayBuffer = (base64) => {
+            const binaryString = window.atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        };
+
+        // Bridge routing resolution execution targets called straight from Swift
         window.iosUSBBridgeResolve = function(id, data) {
             if (window.iosUSBCallbacks[id]) {
                 window.iosUSBCallbacks[id].resolve(data);
@@ -20,7 +35,6 @@
             }
         };
 
-        // Native pipeline rejection hook called from Swift when hardware fails or disconnects
         window.iosUSBBridgeReject = function(id, error) {
             if (window.iosUSBCallbacks[id]) {
                 window.iosUSBCallbacks[id].reject(new Error(error));
@@ -29,94 +43,104 @@
         };
 
         /**
-         * Mock USBDevice Object
-         * Implements the standard W3C WebUSB interface spec so generic 
-         * web applications can run their native methods without throwing errors.
+         * Real USBDevice Wrapper Implementation
          */
-        class MockUSBDevice {
-            constructor(nativeMeta) {
-                this.productName = nativeMeta.productName || "iOS Connected USB Device";
-                this.vendorId = nativeMeta.vendorId || 0x1234;
-                this.productId = nativeMeta.productId || 0xabcd;
-                this.opened = true;
+        class RealUSBDevice {
+            constructor(deviceMeta) {
+                this.productName = deviceMeta.productName || "USB Accessory";
+                this.vendorId = deviceMeta.vendorId;
+                this.productId = deviceMeta.productId;
+                this.opened = deviceMeta.opened || false;
             }
 
             async open() {
-                return Promise.resolve();
-            }
-
-            async selectConfiguration(num) {
-                return Promise.resolve();
-            }
-
-            async claimInterface(num) {
-                return Promise.resolve();
-            }
-
-            /**
-             * Intercepts standard outbound binary streams and translates them to text strings for Swift.
-             */
-            async transferOut(endpoint, data) {
-                const decoder = new TextDecoder();
-                const payloadText = decoder.decode(data);
-                
                 return new Promise((resolve, reject) => {
                     const callbackId = Math.random().toString(36).substring(2);
                     window.iosUSBCallbacks[callbackId] = {
-                        resolve: (response) => {
-                            resolve({ status: "ok", bytesWritten: data.byteLength });
-                        },
+                        resolve: () => { this.opened = true; resolve(); },
                         reject
                     };
-                    
                     window.webkit.messageHandlers.iosUSBBridge.postMessage({
-                        action: "write",
-                        callbackId: callbackId,
-                        endpoint: endpoint,
-                        data: payloadText
+                        action: "open",
+                        callbackId: callbackId
                     });
                 });
             }
 
-            /**
-             * Intercepts standard inbound hardware requests and turns the text response back into a binary DataView.
-             */
-            async transferIn(endpoint, length) {
+            async selectConfiguration(configurationValue) {
+                return new Promise((resolve, reject) => {
+                    const callbackId = Math.random().toString(36).substring(2);
+                    window.iosUSBCallbacks[callbackId] = { resolve, reject };
+                    window.webkit.messageHandlers.iosUSBBridge.postMessage({
+                        action: "selectConfiguration",
+                        callbackId: callbackId,
+                        configurationValue: configurationValue
+                    });
+                });
+            }
+
+            async claimInterface(interfaceNumber) {
+                return new Promise((resolve, reject) => {
+                    const callbackId = Math.random().toString(36).substring(2);
+                    window.iosUSBCallbacks[callbackId] = { resolve, reject };
+                    window.webkit.messageHandlers.iosUSBBridge.postMessage({
+                        action: "claimInterface",
+                        callbackId: callbackId,
+                        interfaceNumber: interfaceNumber
+                    });
+                });
+            }
+
+            async transferOut(endpointNumber, data) {
+                // Extract raw buffer from DataView or ArrayBuffer input
+                const rawBuffer = data.buffer ? data.buffer : data;
+                const base64Payload = ArrayBufferToBase64(rawBuffer);
+
                 return new Promise((resolve, reject) => {
                     const callbackId = Math.random().toString(36).substring(2);
                     window.iosUSBCallbacks[callbackId] = {
-                        resolve: (response) => {
-                            const encoder = new TextEncoder();
-                            const view = encoder.encode(response);
-                            resolve({ status: "ok", data: new DataView(view.buffer) });
+                        resolve: (bytesWritten) => {
+                            resolve({ status: "ok", bytesWritten: bytesWritten || data.byteLength });
                         },
                         reject
                     };
-                    
                     window.webkit.messageHandlers.iosUSBBridge.postMessage({
-                        action: "read",
+                        action: "transferOut",
                         callbackId: callbackId,
-                        endpoint: endpoint,
+                        endpointNumber: endpointNumber,
+                        data: base64Payload
+                    });
+                });
+            }
+
+            async transferIn(endpointNumber, length) {
+                return new Promise((resolve, reject) => {
+                    const callbackId = Math.random().toString(36).substring(2);
+                    window.iosUSBCallbacks[callbackId] = {
+                        resolve: (base64Response) => {
+                            const buffer = Base64ToArrayBuffer(base64Response);
+                            resolve({ status: "ok", data: new DataView(buffer) });
+                        },
+                        reject
+                    };
+                    window.webkit.messageHandlers.iosUSBBridge.postMessage({
+                        action: "transferIn",
+                        callbackId: callbackId,
+                        endpointNumber: endpointNumber,
                         length: length
                     });
                 });
             }
         }
 
-        /**
-         * Custom Navigator.USB Interface Implementation
-         */
         const customUSB = {
             requestDevice: function(options) {
                 return new Promise((resolve, reject) => {
                     const callbackId = Math.random().toString(36).substring(2);
                     window.iosUSBCallbacks[callbackId] = {
-                        resolve: (deviceMeta) => {
-                            resolve(new MockUSBDevice(deviceMeta));
-                        },
+                        resolve: (deviceMeta) => { resolve(new RealUSBDevice(deviceMeta)); },
                         reject
                     };
-                    
                     window.webkit.messageHandlers.iosUSBBridge.postMessage({
                         action: "requestDevice",
                         callbackId: callbackId,
@@ -126,19 +150,28 @@
             },
             
             getDevices: function() {
-                return Promise.resolve([]);
+                return new Promise((resolve, reject) => {
+                    const callbackId = Math.random().toString(36).substring(2);
+                    window.iosUSBCallbacks[callbackId] = {
+                        resolve: (deviceList) => {
+                            resolve(deviceList.map(dev => new RealUSBDevice(dev)));
+                        },
+                        reject
+                    };
+                    window.webkit.messageHandlers.iosUSBBridge.postMessage({
+                        action: "getDevices",
+                        callbackId: callbackId
+                    });
+                });
             }
         };
 
-        // Overwrite the restricted property on navigator with our polyfill architecture
         Object.defineProperty(navigator, "usb", {
             value: customUSB,
             writable: true,
             configurable: true
         });
 
-        console.log("WebUSB iOS Polyfill Core System Fully Activated.");
-    } else {
-        console.error("WebUSB Native Bridge Initialization Error: Native host context not found.");
+        console.log("WebUSB Real iOS Bridge System Initialized.");
     }
 })();
